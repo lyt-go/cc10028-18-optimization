@@ -141,18 +141,46 @@ class DocVersionService(BaseModuleService):
         }
 
     def publish_snapshot(self, snapshot_id: str) -> dict[str, Any]:
-        """发布指定版本快照到目标系统，将快照状态更新为'已发布'。"""
+        """发布指定版本快照到目标系统，将快照状态更新为'已发布'。
+
+        发布前核对：若该快照已有交付清单，必须先通过交付核验（分片 SHA256、
+        行数与记录明细全部确认）才允许发布，并把可复查的交付回执一并返回；
+        未全部确认的分片不会随发布外流。
+        """
+        target_snap = None
         version_files = sorted(self._data_dir("versions").glob("*.jsonl"))
         for vf in version_files:
-            data = self._read_jsonl(vf)
-            for snap in data:
+            for snap in self._read_jsonl(vf):
                 if snap.get("快照编号") == snapshot_id:
-                    snap["status"] = "已发布"
-                    output_path = self._data_dir("versions") / f"{snapshot_id}_published.jsonl"
-                    self._write_jsonl(output_path, [snap])
-                    return {
-                        "snapshot_id": snapshot_id,
-                        "status": "已发布",
-                        "output": str(output_path),
-                    }
-        return {"error": f"版本快照 {snapshot_id} 不存在"}
+                    target_snap = snap
+                    break
+            if target_snap:
+                break
+        if target_snap is None:
+            return {"error": f"版本快照 {snapshot_id} 不存在"}
+
+        # 发布前核对交付分片与记录明细，核验通过才出具可复查回执
+        receipt = None
+        cls = self._safe_import("app.services.result_deliver", "ResultDeliverService")
+        deliver_svc = cls()
+        if deliver_svc.get_manifest(snapshot_id) is not None:
+            verification = deliver_svc.verify_delivery(snapshot_id)
+            if not verification.get("ok"):
+                return {
+                    "error": f"交付分片核验未通过，禁止发布：{verification.get('error', '')}",
+                    "snapshot_id": snapshot_id,
+                    "verification": verification,
+                }
+            receipt = verification["receipt"]
+
+        target_snap["status"] = "已发布"
+        output_path = self._data_dir("versions") / f"{snapshot_id}_published.jsonl"
+        self._write_jsonl(output_path, [target_snap])
+        result = {
+            "snapshot_id": snapshot_id,
+            "status": "已发布",
+            "output": str(output_path),
+        }
+        if receipt is not None:
+            result["delivery_receipt"] = receipt
+        return result
